@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+*.log
+
+# 本地工作区数据（记忆/日志，不上传）
+.workbuddy/
+
+# 构建产物：安装包通过 GitHub Releases 发布
+*.zip
+
+# 凭证：任何情况下都不要把 Token 提交到公开仓库
+*_token.txt
+*_token
+*.token
+settings/
+koreader/settings/
+
+# 生成器临时文件
+/tmp/
