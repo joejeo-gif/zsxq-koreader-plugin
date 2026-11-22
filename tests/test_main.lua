@@ -1,7 +1,7 @@
 local workspace = arg[1]
 assert(workspace, "workspace path required")
 package.path = workspace .. "/zsxq.koplugin/?.lua;" .. package.path
-package.preload["json"] = function() return dofile("/tmp/zsxq-test-json.lua") end
+package.preload["json"] = function() return dofile(workspace .. "/tests/json_stub.lua") end
 
 -- ===== UIManager stub：窗口栈 + on_destroy 联动 =====
 local shown, closed = {}, {}
@@ -488,10 +488,94 @@ check(#opened_files > files_before_eob and opened_files[#opened_files] == "/tmp/
 Zsxq.ui = { document = { file = "/mnt/us/books/other.epub" } }
 check(Zsxq:onEndOfBook() == false, "EndOfBook on unrelated documents must be ignored")
 -- 本页最后一帖：给用户可见反馈而不是静默失败
+-- v15：仍要返回 true 吞掉事件，否则 ReaderStatus 会接着弹「文档结束」菜单
 Zsxq.ui = { document = { file = "/tmp/zsxq_topic_t3.html" } }
-check(Zsxq:onEndOfBook() == false, "EndOfBook on the last topic should not navigate")
+check(Zsxq:onEndOfBook() == true, "EndOfBook on the last topic must consume the event, not show the end menu")
 check(last_notify() ~= nil and last_notify().text:match("最后一帖") ~= nil,
     "last topic must notify the user instead of failing silently")
+
+-- ===== v15：实体翻页键误报 EndOfBook / ReaderStatus 接管 / 补丁重试 =====
+-- 页面还在文档中间却被广播 EndOfBook（CRE 滚动模式 pan_diff 被 overlap 抵消）：
+-- 必须静默吞掉、补跳一页，且不能弹菜单、不能切下一篇。
+local mid_reader = {
+    document = {
+        file = "/tmp/zsxq_topic_t2.html",
+        getPageCount = function() return 20 end,
+    },
+    rolling = {
+        current_page = 2,
+        onGotoPage = function(self, page) self.current_page = page end,
+    },
+}
+Zsxq.ui = mid_reader
+local mid_files, mid_shown = #opened_files, #shown
+check(Zsxq:handleEndOfBook(mid_reader) == true,
+    "spurious EndOfBook must be consumed so the end-of-document menu never appears")
+check(mid_reader.rolling.current_page == 3,
+    "spurious EndOfBook must still advance one page for hardware page-turn keys")
+check(#opened_files == mid_files, "spurious EndOfBook must not switch to the next topic")
+check(#shown == mid_shown, "spurious EndOfBook must stay silent (no toast)")
+
+-- 上下文路径兜底：KOReader 规范化路径后仍能按 HTML 文件名找到连读上下文
+Zsxq.ui = { document = { file = "/opt/koreader/cache/articles/zsxq_topic_t3.html" } }
+check(Zsxq:onEndOfBook() == true, "context lookup must fall back to the HTML basename")
+check(last_notify() ~= nil and last_notify().text:match("最后一帖") ~= nil,
+    "basename fallback must resolve to the last-topic context")
+
+-- openReaderHtml 的补丁：document.file 还是上一篇时必须继续重试，
+-- 匹配成功后要包装 status.onEndOfBook，让星球文档不再弹「文档结束」菜单。
+local patch_path = cache:topicHTMLPath("v15patch")
+local status_original_calls = 0
+local fake_reader = {
+    document = {
+        file = patch_path,
+        configurable = {},
+        setEmbeddedStyleSheet = function() end,
+    },
+    ui = { handleEvent = function() end },
+    onClose = function() end,
+    status = {
+        onEndOfBook = function() status_original_calls = status_original_calls + 1 end,
+    },
+}
+fake_reader.zsxq = Zsxq
+local switched_by_patch = 0
+Zsxq:openReaderHtml("v15patch", "<html></html>", nil, {
+    next_reading = function() switched_by_patch = switched_by_patch + 1 end,
+})
+local first_patch = scheduled[#scheduled]
+check(type(first_patch) == "function", "reader patch must be scheduled after showReader")
+-- 第一次：仍是旧文档 → 不该打补丁，必须继续排队重试
+ReaderUIStub.instance = { document = { file = "/tmp/zsxq_topic_old.html" } }
+local before_retry = #scheduled
+first_patch()
+check(#scheduled > before_retry, "patch must keep retrying while document.file does not match")
+check(fake_reader.status._zsxq_eob_patched == nil, "patch must not touch a mismatched reader")
+-- 第二次：目标文档已就绪 → 补丁生效
+ReaderUIStub.instance = fake_reader
+scheduled[#scheduled]()
+check(fake_reader.status._zsxq_eob_patched == true,
+    "ReaderStatus.onEndOfBook must be wrapped once the reader is ready")
+check(type(fake_reader.showFileManager) == "function", "showFileManager must still be overridden")
+local switch_start = #scheduled
+local eob_handled = fake_reader.status:onEndOfBook()
+check(eob_handled == true, "wrapped EndOfBook must be consumed by the plugin")
+check(status_original_calls == 0, "native end-of-document popup must be suppressed for zsxq documents")
+check(last_notify() ~= nil and last_notify().text:match("下一篇") ~= nil,
+    "wrapped EndOfBook must announce the automatic switch")
+-- 跑完两段式延迟回调：先关当前文档，再打开下一篇
+for i = switch_start + 1, #scheduled do scheduled[i]() end
+if #scheduled > switch_start + 1 then scheduled[#scheduled]() end
+check(switched_by_patch == 1, "wrapped EndOfBook must actually open the next topic")
+-- 普通文档：没有连读上下文时回落 KOReader 原生行为
+local plain_reader = {
+    document = { file = "/mnt/us/books/other.epub" },
+    status = {
+        onEndOfBook = function() status_original_calls = status_original_calls + 1 end,
+    },
+}
+plain_reader.zsxq = Zsxq
+check(Zsxq:handleEndOfBook(plain_reader) == false, "unrelated documents must fall back to native behaviour")
 
 -- ===== 功能页正文+评论连续显示（楼中楼单行、无序号、无时间） =====
 local fp_comments = {
@@ -765,6 +849,14 @@ check(saved_settings.activate_menu == "swipe",
 check(registered_zones ~= nil and #registered_zones == 1 and registered_zones[1].id == "zsxq_top_tap",
     "plugin must register a top tap zone in reader context")
 check(registered_zones[1].handler() == true, "top tap on a topic document must be consumed")
+-- 上方四分之一区域；overrides 提高优先级但不影响其他区域的翻页
+check(registered_zones[1].screen_zone.ratio_y == 0
+    and registered_zones[1].screen_zone.ratio_h == 1 / 4,
+    "top tap zone must cover exactly the upper quarter of the screen")
+local zone_overrides = {}
+for _, id in ipairs(registered_zones[1].overrides or {}) do zone_overrides[id] = true end
+check(zone_overrides.tap_forward and zone_overrides.tap_backward,
+    "top tap must outrank page-turn zones without disabling page turns elsewhere")
 local feature_dialog = last("ButtonDialog")
 check(feature_dialog ~= nil and #feature_dialog.buttons == 6,
     "feature menu should list next/prev/jump/reply/return/close actions")
@@ -812,6 +904,25 @@ for _, row in ipairs(feature_dialog.buttons) do
 end
 check(reader_ctx_ui.closed == true and Zsxq.list_menu == list_after_return,
     "关闭图文 closes the document without rebuilding the list")
+-- 无上一篇/下一篇时，四个常用项仍固定出现（禁用态），菜单位置不跳动
+Zsxq:openReaderHtml("v16menu", "<html></html>", nil, { topic = { topic_id = "x" } })
+reader_ctx_ui.document.file = cache:topicHTMLPath("v16menu")
+Zsxq.ui = reader_ctx_ui
+Zsxq:showFeatureMenu()
+local fixed_menu = last("ButtonDialog")
+local next_row, prev_row, back_row, close_row
+for _, row in ipairs(fixed_menu.buttons) do
+    if row[1].text == "下一篇 ›" then next_row = row[1] end
+    if row[1].text == "‹ 上一篇" then prev_row = row[1] end
+    if row[1].text == "返回帖子列表" then back_row = row[1] end
+    if row[1].text == "✕ 关闭图文" then close_row = row[1] end
+end
+check(next_row ~= nil and next_row.enabled == false,
+    "feature menu must always offer a next-topic entry, disabled when unavailable")
+check(prev_row ~= nil and prev_row.enabled == false,
+    "feature menu must always offer a prev-topic entry, disabled when unavailable")
+check(back_row ~= nil and close_row ~= nil,
+    "return-to-list and close must always be present in the feature menu")
 -- 普通文档：轻点顶部不弹功能菜单（KOReader 菜单走下滑手势）
 local other_zones = nil
 local other_ui = {

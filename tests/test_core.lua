@@ -2,11 +2,12 @@ local workspace = arg[1]
 assert(workspace, "workspace path required")
 package.path = workspace .. "/zsxq.koplugin/?.lua;" .. package.path
 package.preload["json"] = function()
-    return dofile("/tmp/zsxq-test-json.lua")
+    return dofile(workspace .. "/tests/json_stub.lua")
 end
 
 local JSON = require("json")
 local Content = require("zsxq_content")
+local Html = require("zsxq_html")
 local API = require("zsxq_api")
 
 local passed = 0
@@ -214,5 +215,128 @@ check(article_text:match("内嵌长文") ~= nil, "inline article title should be
 
 check(Content.hash("https://example.com") == Content.hash("https://example.com"), "article cache key should be stable")
 check(Content.truncate("中文标题", 6) == "中文…", "UTF-8 truncation should not split a character")
+
+-- ===== v15：Markdown 长文标题/链接去重 =====
+-- 真实样本：API 的 title 是正文首行的截断版，正文首行是完整标题，
+--  <e type="web"> 的 title 又是同一句，旧 HTML 会让同一句话出现 6 次。
+local md_topic = {
+    title = "【关于昇腾扩产预期与GPU代工...",
+    content = "# 【关于昇腾扩产预期与GPU代工风险汇报】\n\n一、华为昇腾：2027年国产算力供给有望大幅提升\n\n点此阅读：<e type=\"web\" href=\"https%3A%2F%2Farticles.zsxq.com%2Fid_abc.html\" title=\"%E3%80%90%E5%85%B3%E4%BA%8E%E6%98%87%E8%85%BE%E6%89%A9%E4%BA%A7%E9%A2%84%E6%9C%9F%E4%B8%8EGPU%E4%BB%A3%E5%B7%A5%E9%A3%8E%E9%99%A9%E6%B1%87%E6%8A%A5%E3%80%91\" />",
+    text_type = "markdown",
+    owner = { name = "简单的舟" },
+    create_time = "2026-11-19T10:17:08.855+0800",
+    counts = { comments = 12, likes = 3, readers = 100 },
+}
+check(Content.topicTitle(md_topic) == "【关于昇腾扩产预期与GPU代工风险汇报】",
+    "markdown h1 marker must not leak into the document title")
+local md_body = Content.topicBody(md_topic)
+check(md_body:match("链接：") == nil, "topicBody must exclude the topicText link section")
+check(md_body:match("简单的舟") == nil, "topicBody must exclude the metadata header")
+local md_html = Html.topicToHtml(md_topic, nil, {})
+check(select(2, md_html:gsub("昇腾扩产预期与GPU代工", "")) == 2,
+    "title phrase must only appear in <title> and <h1>")
+check(md_html:match("%[链接1%]") ~= nil, "inline link marker must survive title dedupe")
+check(select(2, md_html:gsub("class=\"links\"", "")) == 1,
+    "link section must be rendered exactly once")
+check(select(2, md_html:gsub("id_abc%.html", "")) == 1,
+    "article URL must appear exactly once")
+check(md_html:match("一、华为昇腾") ~= nil, "actual body text must be preserved")
+-- 反向保护：标题/正文首行/链接文字各不相同的时候，一个字都不能被删
+local distinct_html = Html.topicToHtml({
+    title = "独立标题",
+    content = "正文第一行内容\n\n参考 <e type=\"web\" href=\"https%3A%2F%2Fexample.com%2Fa\" title=\"%E5%8F%A6%E4%B8%80%E4%B8%AA%E6%A0%87%E9%A2%98\" />",
+}, nil, {})
+check(distinct_html:match("正文第一行内容") ~= nil,
+    "body first line must be preserved when it differs from the title")
+check(distinct_html:match("另一个标题 %[链接1%]") ~= nil,
+    "distinct inline link labels must not be stripped")
+
+-- ===== v15：转载原帖（referenced_topic.topic）=====
+local repost_topic = {
+    topic_id = "111",
+    title = "谢谢萤火虫...",
+    content = "谢谢萤火虫，终于可以读起来了",
+    owner = { name = "转载者" },
+    group = { group_id = "28882552825211", name = "半隐书院" },
+    create_time = "2026-11-18T22:00:00.000+0800",
+    counts = { comments = 1 },
+    referenced_topic = { topic = {
+        topic_id = "82258422884424422",
+        title = "腾讯控股 2026 年第三季度业绩电话会全文",
+        content = "<e type=\"text_bold\" title=\"%E8%85%BE%E8%AE%AF%E6%8E%A7%E8%82%A1\" />\n\n会议时间：2026 年 11 月 18 日",
+        owner = { name = "萤火虫fly" },
+        group = { group_id = "28882552825211", name = "半隐书院" },
+        create_time = "2026-11-18T21:44:54.189+0800",
+        text_type = "plain",
+    } },
+}
+local ref = Content.referencedTopic(repost_topic)
+check(ref ~= nil, "referenced_topic must be parsed")
+check(ref.title == "腾讯控股 2026 年第三季度业绩电话会全文", "original title must be kept")
+check(ref.author == "萤火虫fly", "original author must be kept")
+check(ref.group == "半隐书院", "original group must be kept")
+check(ref.content:match("会议时间：2026 年 11 月 18 日") ~= nil, "original body must be kept")
+check(ref.url == "https://wx.zsxq.com/group/28882552825211/topic/82258422884424422",
+    "original topic link must use the official web URL pattern")
+local rp_text, rp_links = Content.topicText(repost_topic)
+check(rp_text:match("【转载原帖】") ~= nil, "feature page must show the repost block")
+check(rp_text:match("标题：腾讯控股") ~= nil and rp_text:match("萤火虫fly") ~= nil,
+    "feature page must show the original title and author")
+check(#rp_links == 1 and rp_links[1].url == ref.url,
+    "original link must be exposed to the long-text/link menu")
+local rp_html = Html.topicToHtml(repost_topic, nil, {})
+check(rp_html:match("ref%-head") ~= nil and rp_html:match("转载原帖") ~= nil,
+    "illustrated mode must render the repost block")
+check(rp_html:match("萤火虫fly") ~= nil and rp_html:match("会议时间") ~= nil,
+    "illustrated mode must include the original author and body")
+check(rp_html:find(ref.url, 1, true) ~= nil,
+    "illustrated mode must expose the original topic link")
+check(select(2, rp_html:gsub("class=\"links\"", "")) == 1,
+    "repost topics must still render the link section once")
+check(Content.referencedTopic({ content = "普通帖子" }) == nil,
+    "topics without referenced_topic must not produce a repost block")
+check(Content.referencedText({ content = "普通帖子" }) == "",
+    "topics without referenced_topic must not produce repost text")
+
+-- ===== 作者字段类型安全（KOReader 的 JSON 会把 null 解成非字符串）=====
+check(Content.displayName({ alias = function() end, name = "华仔自由之路" }) == "华仔自由之路",
+    "non-string alias must fall back to the real name")
+check(Content.displayName({ alias = {}, name = "华仔自由之路" }) == "华仔自由之路",
+    "table alias (JSON null in some KOReader builds) must fall back to the name")
+check(Content.displayName({ alias = "群昵称", name = "华仔自由之路" }) == "群昵称",
+    "a real string alias must still take priority")
+local bad_author_html = Html.topicToHtml({
+    title = "测试标题", content = "正文内容",
+    owner = { alias = function() end, name = "华仔自由之路" },
+}, nil, {})
+check(bad_author_html:find("function:", 1, true) == nil,
+    "illustrated mode must never print 'function: 0x...' as the author")
+check(bad_author_html:find('name="author" content="华仔自由之路"', 1, true) ~= nil,
+    "illustrated mode must show the real author name")
+
+-- ===== 长文整篇重复三次（MCP 数据源会把同一篇拼三遍）=====
+local once = "朋友们晚上好，这周又是在见证历史的一周。\n\n" ..
+    string.rep("这是一段用来测试重复检测的长正文内容，必须足够长才能触发周期识别。", 12)
+local tripled = "测试标题\n\n测试标题\n\n\n" .. once .. "\n\n" .. once .. "\n\n" .. once
+local deduped = Content.dedupeRepeatedBody(tripled)
+check(select(2, tripled:gsub("朋友们晚上好，这周又是在见证历史的一周。", "")) == 3,
+    "test fixture must contain three identical copies")
+check(select(2, deduped:gsub("朋友们晚上好，这周又是在见证历史的一周。", "")) == 1,
+    "tripled long body must be reduced to a single copy")
+check(select(2, deduped:gsub("测试标题", "")) == 1,
+    "the source's duplicated leading title must also be removed")
+local short_repeat = string.rep("短句重复。", 3)
+check(Content.dedupeRepeatedBody(short_repeat) == short_repeat,
+    "short texts must not be mistaken for tripled long articles")
+local tripled_topic = {
+    title = "测试标题", content = tripled, owner = { name = "作者" },
+    create_time = "2026-11-21T20:00:00.000+0800",
+}
+local tripled_body = Content.topicBody(tripled_topic)
+check(select(2, tripled_body:gsub("朋友们晚上好，这周又是在见证历史的一周。", "")) == 1,
+    "topicBody must de-duplicate the source content before rendering")
+local tripled_html = Html.topicToHtml(tripled_topic, nil, {})
+check(select(2, tripled_html:gsub("朋友们晚上好，这周又是在见证历史的一周。", "")) == 1,
+    "illustrated mode must not repeat the body three times")
 
 print(string.format("test_core: %d assertions passed", passed))

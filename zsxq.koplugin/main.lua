@@ -28,6 +28,44 @@ local Screen = Device.screen
 -- KOReader 插件在 FileManager / ReaderUI 各有一个实例，跨实例数据必须放模块级。
 local READING_CONTEXTS = {}
 
+-- 上下文查找：KOReader 可能规范化 document.file（绝对/相对、软链接），
+-- 精确匹配失败时按文件名兜底。HTML 文件名就是 topic_id，不会撞车。
+local function contextFor(reader)
+    local doc = reader and reader.document
+    if not doc or not doc.file then return nil end
+    local context = READING_CONTEXTS[doc.file]
+    if context then return context end
+    local base = doc.file:match("([^/]+)$")
+    if not base then return nil end
+    for path, candidate in pairs(READING_CONTEXTS) do
+        if path:match("([^/]+)$") == base then return candidate end
+    end
+    return nil
+end
+
+-- 是否真的翻到了文档末尾。
+-- CRE 滚动模式下实体翻页键偶尔会误报 EndOfBook：onGotoViewRel 里
+-- pan_diff 被行重叠抵消后位置没变，KOReader 就广播 EndOfBook，此时
+-- current_page 还远在文档中间。用总页数判断，把这种误报拦下来。
+local function isAtDocumentEnd(reader)
+    if not reader or not reader.document then return true end
+    local ok, result = pcall(function()
+        local doc = reader.document
+        local rolling = reader.rolling
+        if not rolling or type(rolling.current_page) ~= "number" then return true end
+        if doc.getPageCount then
+            local total = doc:getPageCount()
+            if type(total) == "number" and total > 1
+                and rolling.current_page < total - 1 then
+                return false
+            end
+        end
+        return true
+    end)
+    if not ok then return true end
+    return result
+end
+
 local Zsxq = WidgetContainer:extend{
     name = "zsxq",
     is_doc_only = false,
@@ -41,7 +79,7 @@ function Zsxq:init()
     self.ui.menu:registerToMainMenu(self)
     -- ReaderUI 上下文（图文阅读）：
     -- ① KOReader 菜单改为仅从顶部下滑调出（activate_menu=swipe）
-    -- ② 轻点屏幕上部 → 弹出星球墨读功能菜单（下一篇/上一篇/评论/返回帖子列表）
+    -- ② 轻点屏幕上方四分之一 → 弹出星球墨读功能菜单（下一篇/上一篇/评论/返回帖子列表/关闭图文）
     if self.ui and self.ui.document then
         if G_reader_settings:readSetting("activate_menu") ~= "swipe" then
             G_reader_settings:saveSetting("activate_menu", "swipe")
@@ -50,8 +88,10 @@ function Zsxq:init()
             {
                 id = "zsxq_top_tap",
                 ges = "tap",
-                screen_zone = { ratio_x = 0, ratio_y = 0, ratio_w = 1, ratio_h = 1 / 8 },
-                overrides = { "readermenu_tap", "readermenu_ext_tap" },
+                screen_zone = { ratio_x = 0, ratio_y = 0, ratio_w = 1, ratio_h = 1 / 4 },
+                -- overrides 只决定匹配优先级：这个 zone 排在翻页 zone 之前，
+                -- 上方 1/4 点击优先弹菜单；其余区域仍走 tap_forward/tap_backward 翻页。
+                overrides = { "tap_forward", "tap_backward", "readermenu_tap", "readermenu_ext_tap" },
                 handler = function(ges) return self:onTopTap(ges) end,
             },
         })
@@ -60,8 +100,7 @@ end
 
 -- 轻点屏幕上部：星球帖子里弹功能菜单；其他文档无动作（菜单走下滑手势）
 function Zsxq:onTopTap(ges)
-    local doc = self.ui and self.ui.document
-    if not doc or not READING_CONTEXTS[doc.file] then return true end
+    if not contextFor(self.ui) then return true end
     self:showFeatureMenu()
     return true
 end
@@ -69,8 +108,7 @@ end
 -- 阅读中的功能菜单（ButtonDialog，点击外部即关闭 = 返回正文）。
 -- 每个条目先关闭菜单再执行动作，否则执行后菜单仍停留在屏幕上。
 function Zsxq:showFeatureMenu()
-    local doc = self.ui and self.ui.document
-    local ctx = doc and READING_CONTEXTS[doc.file] or nil
+    local ctx = contextFor(self.ui)
     local dialog
     local function act(fn)
         return function()
@@ -78,19 +116,26 @@ function Zsxq:showFeatureMenu()
             fn()
         end
     end
+    -- 常用项固定占位：没有上一篇/下一篇时显示为禁用态，菜单位置不会跳动。
     local rows = {}
-    if ctx then
-        if ctx.next_topic then
-            table.insert(rows, {{ text = "下一篇 ›", callback = act(ctx.next_topic) }})
-        end
-        if ctx.prev_topic then
-            table.insert(rows, {{ text = "‹ 上一篇", callback = act(ctx.prev_topic) }})
-        end
-    end
+    table.insert(rows, {{
+        text = "下一篇 ›",
+        enabled = ctx ~= nil and ctx.next_topic ~= nil,
+        callback = act(function()
+            if ctx and ctx.next_topic then ctx.next_topic() end
+        end),
+    }})
+    table.insert(rows, {{
+        text = "‹ 上一篇",
+        enabled = ctx ~= nil and ctx.prev_topic ~= nil,
+        callback = act(function()
+            if ctx and ctx.prev_topic then ctx.prev_topic() end
+        end),
+    }})
     table.insert(rows, {{ text = "⤒ " .. _("跳转开头"), callback = act(function()
         self:jumpToDocTop()
     end) }})
-    if ctx.topic then
+    if ctx and ctx.topic then
         local topic = ctx.topic
         table.insert(rows, {{ text = _("写评论"), callback = act(function()
             self:showReplyDialog(topic)
@@ -130,8 +175,7 @@ function Zsxq:addToMainMenu(menu_items)
     -- Kindle 无 Home 键，退出阅读走「返回帖子列表」。
     if self.ui and self.ui.document then
         local function current_context()
-            local doc = self.ui and self.ui.document
-            return doc and READING_CONTEXTS[doc.file] or nil
+            return contextFor(self.ui)
         end
         menu_items.zsxq = {
             text = _("星球墨读"),
@@ -254,23 +298,35 @@ end
 -- 密钥获取指引（Token 输入框 / 未配置提示 / 401 诊断共用）
 local TOKEN_HELP = "知识星球密钥管理（获取知识星球访问凭证，让 AI 助手以你的身份访问星球）\nhttps://garden.zsxq.com/jasmine/"
 
--- 图文阅读（CRE 文档）翻过最后一页再翻页 → 自动进下一篇。
--- KOReader ReaderPaging 在翻越末页时广播 EndOfBook 事件；普通书无上下文，不受影响。
-function Zsxq:onEndOfBook()
-    local ui = self.ui
-    if not ui or not ui.document then return false end
-    local file = ui.document.file
-    if not file then return false end
-    local context = READING_CONTEXTS[file]
-    if not context then return false end
+-- 图文阅读翻过最后一页 → 自动进下一篇。
+-- KOReader 的 EndOfBook 由 ReaderStatus（注册早于插件）先收到，默认会弹
+-- 「文档结束」菜单；openReaderHtml 里会包装 status.onEndOfBook，让星球文档
+-- 走这里的连读逻辑，普通文档仍回落到原生行为。
+function Zsxq:handleEndOfBook(reader)
+    reader = reader or self.ui
+    local context = contextFor(reader)
+    if not context then return false end -- 普通文档，交回 ReaderStatus
+    if not isAtDocumentEnd(reader) then
+        -- 实体翻页键误报：页面其实没动，补跳一页，保证按键仍能翻页
+        pcall(function()
+            local rolling = reader.rolling
+            if rolling and rolling.onGotoPage and type(rolling.current_page) == "number" then
+                rolling:onGotoPage(rolling.current_page + 1)
+            end
+        end)
+        return true -- 吞掉事件：既不弹「文档结束」，也不切下一篇
+    end
     if not context.next_topic then
-        -- 给用户可见反馈，而不是静默失败
         self:notify("已是本页最后一帖。", 3)
-        return false
+        return true
     end
     self:notify("已到末页，正在打开下一篇…", 2)
-    self:switchToNextReading(context)
+    self:switchToNextReading(context, reader)
     return true
+end
+
+function Zsxq:onEndOfBook()
+    return self:handleEndOfBook(self.ui)
 end
 
 -- 下一篇切换：两段式（先关当前文档，再走干净的 showReader 路径）。
@@ -278,14 +334,12 @@ end
 --    当前阅读器，返回后 ReaderRolling 访问已释放文档导致切换被中断。
 -- ② 先关后开：部分 KOReader 版本在"阅读器已打开"时调 showReader 不生效，
 --    先关闭当前文档（已补丁不弹文件管理器）再打开，走验证过的干净路径。
--- 每一步都有可见诊断，失败会提示具体原因。
-function Zsxq:switchToNextReading(context)
+-- reader 由调用方显式传入，避免 FileManager 实例误用自己的 self.ui。
+function Zsxq:switchToNextReading(context, reader)
+    local ui = reader or self.ui
     UIManager:scheduleIn(0.3, function()
         local ok, err = pcall(function()
-            if self.ui and self.ui.onClose then
-                self:notify("正在关闭当前文档…", 2)
-                self.ui:onClose()
-            end
+            if ui and ui.onClose then ui:onClose() end
         end)
         if not ok then
             self:notify("关闭当前文档失败：" .. tostring(err), 6)
@@ -489,7 +543,7 @@ function Zsxq:confirmPurge()
 end
 
 function Zsxq:showHelp()
-    self:notify("星球墨读 · 出品人：简单的舟\n\n在线阅读：点帖子直接显示全文（秒开，不打开阅读器、不联网下载）。\n\n图片：点「图片」弹窗浏览压缩图，点屏幕左右翻页，关闭立即返回。\n\n划线：点「划线」→ 点选段落 → 确认保存；「我的划线」中查看删除。\n\n翻帖：功能页「上一篇/下一篇」按钮；翻到末尾再按翻页键自动进下一篇。\n\n评论/发帖：支持评论、楼中楼回复与发帖，发送前需确认。\n\n📖 图文（可选）：进排版文档（标题加粗、图片内嵌），长按滑动选中即划线，点已划线文字可删除/编辑，AI助手等高亮插件按钮也在其中；轻点屏幕上部可弹功能菜单，含跳转开头。\n\n进度条：图文阅读时轻点屏幕底部边缘可呼出/隐藏底部状态栏（含进度条），样式可在 KOReader「设置 → 状态栏」调整。\n\nMarkdown：加粗、标题、列表等标记自动转为阅读友好的样式。", 30)
+    self:notify("星球墨读 · 出品人：简单的舟\n\n在线阅读：点帖子直接显示全文（秒开，不打开阅读器、不联网下载）。\n\n图片：点「图片」弹窗浏览压缩图，点屏幕左右翻页，关闭立即返回。\n\n划线：点「划线」→ 点选段落 → 确认保存；「我的划线」中查看删除。\n\n翻帖：功能页「上一篇/下一篇」按钮；翻到末尾再按翻页键自动进下一篇（图文模式不再弹「文档结束」菜单）。\n\n评论/发帖：支持评论、楼中楼回复与发帖，发送前需确认。\n\n📖 图文（可选）：进排版文档（标题加粗、图片内嵌），长按滑动选中即划线，点已划线文字可删除/编辑，AI助手等高亮插件按钮也在其中；轻点屏幕上方四分之一区域可弹功能菜单，含下一篇/上一篇/返回帖子列表/关闭图文/跳转开头。\n\n进度条：图文阅读时轻点屏幕底部边缘可呼出/隐藏底部状态栏（含进度条），样式可在 KOReader「设置 → 状态栏」调整。\n\nMarkdown：加粗、标题、列表等标记自动转为阅读友好的样式；长文标题与链接自动去重，只显示一次。\n\n转载：转载帖在正文后附「转载原帖」的标题、作者、正文，原帖链接收在链接区。", 30)
 end
 
 -- ============ 连接诊断 ============
@@ -1163,7 +1217,7 @@ function Zsxq:showCommentPicker(topic, flat)
         local comment = entry.comment
         table.insert(items, {
             text = (entry.depth > 0 and "↳ " or "") ..
-                ((comment.owner and comment.owner.name) or "未知") .. "：" .. Content.truncate(Content.singleLine(comment.text), 100),
+                Content.displayName(comment.owner) .. "：" .. Content.truncate(Content.singleLine(comment.text), 100),
             callback = function()
                 self:closeListMenu()
                 self:showReplyDialog(topic, comment)
@@ -1176,7 +1230,7 @@ end
 function Zsxq:showReplyDialog(topic, comment)
     if not self:ensureToken() then return end
     local dialog
-    local target = comment and ("回复 " .. ((comment.owner and comment.owner.name) or "评论者")) or "评论帖子"
+    local target = comment and ("回复 " .. Content.displayName(comment.owner)) or "评论帖子"
     dialog = InputDialog:new{
         title = target,
         description = "帖子：" .. Content.topicTitle(topic) .. "\n发送前还会要求确认完整内容。",
@@ -1210,7 +1264,7 @@ function Zsxq:showReplyDialog(topic, comment)
 end
 
 function Zsxq:confirmReply(topic, comment, text)
-    local target = comment and ("楼中楼回复 " .. ((comment.owner and comment.owner.name) or "评论者")) or "帖子顶层评论"
+    local target = comment and ("楼中楼回复 " .. Content.displayName(comment.owner)) or "帖子顶层评论"
     local viewer
     viewer = TextViewer:new{
         title = _("确认发送评论"),
@@ -1529,22 +1583,37 @@ function Zsxq:openReaderHtml(key, html, note, context)
     end
     if note then self:notify(note, 6) end
     ReaderUI:showReader(path)
-    -- 等文档真正打开后打补丁（ReaderUI 用协程异步创建实例）
+    -- 等文档真正打开后打补丁（ReaderUI 用协程异步创建实例）。
+    -- 旧实现在「reader.document 已存在但 file 还是上一篇」时直接 return，
+    -- 补丁就永远打不上——这是翻页连读时好时坏、退出偶尔回不到列表的根因。
+    -- 必须一直重试到 document.file 与目标路径一致为止。
     local attempts = 0
     local function patch_reader()
         local reader = ReaderUI.instance
-        if reader and reader.document then
-            if reader.document.file == path then
-                reader.showFileManager = function() end
-                -- 自动开启「内嵌样式」：帖子 HTML 的排版样式（标题加粗、字号、图片布局）全在这里
-                if reader.document.setEmbeddedStyleSheet then
-                    if reader.document.configurable then
-                        reader.document.configurable.embedded_css = 1
-                    end
-                    reader.document:setEmbeddedStyleSheet(1)
-                    if reader.ui and reader.ui.handleEvent then
-                        reader.ui:handleEvent(Event:new("UpdatePos"))
-                    end
+        if reader and reader.document and reader.document.file == path then
+            reader.showFileManager = function() end
+            -- 自动开启「内嵌样式」：帖子 HTML 的排版样式（标题加粗、字号、图片布局）全在这里
+            if reader.document.setEmbeddedStyleSheet then
+                if reader.document.configurable then
+                    reader.document.configurable.embedded_css = 1
+                end
+                reader.document:setEmbeddedStyleSheet(1)
+                if reader.ui and reader.ui.handleEvent then
+                    reader.ui:handleEvent(Event:new("UpdatePos"))
+                end
+            end
+            -- 接管「文档结束」：ReaderStatus 注册早于插件，默认会弹 end_document
+            -- 菜单并抢先消费 EndOfBook。包装后星球文档走翻页连读、不再弹菜单；
+            -- 普通文档（无连读上下文）仍回落到 KOReader 原生行为。
+            local status = reader.status
+            local plugin = reader.zsxq or self
+            if status and type(status.onEndOfBook) == "function"
+                and not status._zsxq_eob_patched then
+                local original = status.onEndOfBook
+                status._zsxq_eob_patched = true
+                status.onEndOfBook = function(status_self)
+                    if plugin:handleEndOfBook(reader) then return true end
+                    return original(status_self)
                 end
             end
             return

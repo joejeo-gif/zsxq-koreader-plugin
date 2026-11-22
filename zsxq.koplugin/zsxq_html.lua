@@ -28,6 +28,8 @@ figcaption { font-style: italic; font-size: 0.85em; }
 .c-author { font-weight: bold; }
 .c-meta { color: #888888; font-size: 0.5em; }
 .c-reply { margin-left: 1.2em; }
+.ref-head { font-weight: bold; }
+.ref-title { font-weight: bold; }
 </style>]]
 
 -- 纯文本正文 → <p> 段落；空行分段。
@@ -57,6 +59,42 @@ local function textToParagraphs(text, inline_image)
         table.insert(out, "<p>" .. block .. "</p>")
     end
     if #out == 0 then table.insert(out, "<p>（此帖子没有文字正文）</p>") end
+    return table.concat(out, "\n")
+end
+
+-- 标题去重：知识星球 API 的 title 常是正文首行的截断版（"xxx..."），
+-- topicTitle 会把它提升成正文首行；若 HTML 再写 <h1>、正文又保留首行、
+-- 链接区再列一次同名标题，同一句话会出现三四次。这里统一收口。
+-- 全程用 plain 比较，避免 Lua 5.1 按字节解析 UTF-8 字符类时误伤汉字。
+local function sameTitle(a, b)
+    local na = Content.singleLine(Content.stripBlockPrefix(a))
+    local nb = Content.singleLine(Content.stripBlockPrefix(b))
+    if na == "" or nb == "" then return false end
+    if na == nb then return true end
+    local short, long
+    if #na <= #nb then short, long = na, nb else short, long = nb, na end
+    return #short >= 8 and #short / #long >= 0.55
+        and long:find(short, 1, true) ~= nil
+end
+
+local function stripLeadingTitle(body, title)
+    local first, rest = body:match("^([^\n]+)\n(.*)$")
+    if not first then first, rest = body, "" end
+    if not sameTitle(first, title) then return body end
+    return (rest:gsub("^[\n\r]+", ""))
+end
+
+-- <e type="web" title="同名长文标题"/> 解析后会变成 "同名标题 [链接1]"，去掉重复的标题文字
+local function stripInlineTitleLinks(body, title)
+    local out = {}
+    for line in (body .. "\n"):gmatch("([^\n]*)\n") do
+        line = line:gsub("(.-) %[链接(%d+)%]", function(label, num)
+            if sameTitle(label, title) then return "[链接" .. num .. "]" end
+        end)
+        table.insert(out, line)
+    end
+    -- gmatch 会多出一个尾部空行，去掉以免正文尾部多空段
+    if #out > 0 and out[#out] == "" then table.remove(out) end
     return table.concat(out, "\n")
 end
 
@@ -94,7 +132,7 @@ local function repliesToHtml(comment)
         local owner = reply.owner or {}
         local repliee = reply.repliee and reply.repliee.name
         local head = string.format('<span class="c-author">%s</span>',
-            escape(owner.alias or owner.name or "未知"))
+            escape(Content.displayName(owner)))
         if repliee then
             head = head .. metaSpan(" 回复 @" .. repliee)
         end
@@ -109,7 +147,7 @@ local function commentToHtml(comment)
     local owner = comment.owner or {}
     local head = {
         string.format('<span class="c-author">%s</span>',
-            escape(owner.alias or owner.name or "未知")),
+            escape(Content.displayName(owner))),
         metaSpan(Content.longTime(comment.create_time)),
         metaSpan("♥ " .. tostring(comment.likes_count or 0)),
     }
@@ -141,17 +179,38 @@ function Html.commentsToHtml(comments, total_count)
     return table.concat(parts, "\n")
 end
 
+-- 转载原帖区块：标题 / 作者 / 星球 / 时间 / 正文。原帖链接统一在 links 区，
+-- 这样默认视图的「长文/链接」按钮与图文模式的链接区都能扫码打开。
+function Html.referencedToHtml(topic)
+    local ref = Content.referencedTopic(topic)
+    if not ref then return "" end
+    local meta = { escape(ref.author) }
+    if ref.group ~= "" then table.insert(meta, escape(ref.group)) end
+    if ref.time ~= "" then table.insert(meta, escape(ref.time)) end
+    local parts = {
+        '<hr/>',
+        '<p class="ref-head">【转载原帖】</p>',
+        '<p class="ref-title">' .. escape(ref.title) .. '</p>',
+        '<p class="meta">' .. table.concat(meta, " · ") .. '</p>',
+        textToParagraphs(ref.content ~= "" and ref.content or "（原帖无文字正文）"),
+    }
+    return table.concat(parts, "\n")
+end
+
 -- resolved_images 可为 nil（无图/未解析）；含本地路径的图以内嵌方式呈现
 -- comments 可为 nil（不加载评论）；传入时正文后连续显示评论区
 -- 正文中的 [图片n] 占位在原位内嵌对应图片；无占位的图片仍排在文末
 function Html.topicToHtml(topic, resolved_images, comments)
     topic = topic or {}
-    local text, links = Content.topicText(topic)
-    -- 只保留正文（跳过元数据头）
-    local body = text:match("────────────────\n(.*)$") or text
+    -- 直接用纯正文，不再从 topicText 的字符串里切：旧的切法会把「链接：」区
+    -- 一起切进正文，末尾又追加一次，造成链接和长文标题重复。
+    local body, links = Content.topicBody(topic)
+    local title = Content.topicTitle(topic)
+    body = stripLeadingTitle(body, title)
+    body = stripInlineTitleLinks(body, title)
 
     local owner = topic.owner or {}
-    local author = owner.alias or owner.name or "未知"
+    local author = Content.displayName(owner)
     local meta = { escape(author) }
     local location = owner.location or topic.location
     if location and location ~= "" then table.insert(meta, escape(location)) end
@@ -184,12 +243,12 @@ function Html.topicToHtml(topic, resolved_images, comments)
     local parts = {
         '<!DOCTYPE html>',
         '<html><head><meta charset="utf-8"/>',
-        '<title>' .. escape(Content.topicTitle(topic)) .. '</title>',
+        '<title>' .. escape(title) .. '</title>',
         '<meta name="author" content="' .. escape(author) .. '"/>',
         '<meta name="description" content="' .. escape(description) .. '"/>',
         STYLE,
         '</head><body>',
-        '<h1>' .. escape(Content.topicTitle(topic)) .. '</h1>',
+        '<h1>' .. escape(title) .. '</h1>',
         '<p class="meta">' .. description .. '</p>',
         '<hr/>',
         textToParagraphs(body, inline_image),
@@ -199,11 +258,18 @@ function Html.topicToHtml(topic, resolved_images, comments)
         table.insert(parts, '<hr/>')
         table.insert(parts, image_html)
     end
+    local ref_html = Html.referencedToHtml(topic)
+    if ref_html ~= "" then table.insert(parts, ref_html) end
     if #links > 0 then
         local link_lines = {}
         for i, link in ipairs(links) do
-            table.insert(link_lines, string.format("[%d] %s<br/>%s",
-                i, escape(link.title), escape(link.url)))
+            -- 与文档标题同名的长文链接只列 URL，标题已在 <h1> 出现，不再重复
+            if sameTitle(link.title, title) then
+                table.insert(link_lines, string.format("[%d] %s", i, escape(link.url)))
+            else
+                table.insert(link_lines, string.format("[%d] %s<br/>%s",
+                    i, escape(link.title), escape(link.url)))
+            end
         end
         table.insert(parts,
             '<hr/><p class="links"><b>链接：</b><br/>' .. table.concat(link_lines, "<br/>") .. '</p>')
@@ -225,7 +291,7 @@ function Html.imagesToHtml(topic, resolved_images)
         '<!DOCTYPE html>',
         '<html><head><meta charset="utf-8"/>',
         '<title>图片 · ' .. title .. '</title>',
-        '<meta name="author" content="' .. escape(owner.alias or owner.name or "未知") .. '"/>',
+        '<meta name="author" content="' .. escape(Content.displayName(owner)) .. '"/>',
         STYLE,
         '</head><body>',
         '<h1>图片 · ' .. title .. '</h1>',

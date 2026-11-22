@@ -1,7 +1,7 @@
 local workspace = arg[1]
 assert(workspace, "workspace path required")
 package.path = workspace .. "/zsxq.koplugin/?.lua;" .. package.path
-package.preload["json"] = function() return dofile("/tmp/zsxq-test-json.lua") end
+package.preload["json"] = function() return dofile(workspace .. "/tests/json_stub.lua") end
 package.preload["datastorage"] = function()
     return { getSettingsDir = function() return "/tmp" end }
 end

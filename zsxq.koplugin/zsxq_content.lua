@@ -207,6 +207,67 @@ function Content.singleLine(text)
     return trim(tostring(text or ""):gsub("%s+", " "))
 end
 
+-- 作者显示名：知识星球列表里 alias 常为 JSON null，KOReader 的 json 库会把它
+-- 解码成非字符串（有些版本是函数），`alias or name` 会把它当真值，正文里就
+-- 出现 "function: 0x75995b68"。这里只接受非空字符串，其他一律回落到 name。
+function Content.displayName(owner)
+    if type(owner) ~= "table" then return "未知" end
+    local alias = owner.alias
+    if type(alias) == "string" and trim(alias) ~= "" then return alias end
+    local name = owner.name
+    if type(name) == "string" and trim(name) ~= "" then return name end
+    return "未知"
+end
+
+-- 知识星球 MCP 对部分长文会把整篇正文原样拼接 2~3 遍（半隐书院的长文尤多）。
+-- 检测「同一长行等距出现三次且各块逐字相同」，只保留第一份。
+-- 只在长文本上做，短正文不碰，避免误伤正常的重复句子。
+function Content.dedupeRepeatedBody(text)
+    text = tostring(text or "")
+    if #text < 600 then return text end
+    local total = #text
+    for line in (text .. "\n"):gmatch("([^\n]+)\n") do
+        if #line >= 40 then
+            local positions, from = {}, 1
+            while #positions < 4 do
+                local at = text:find(line, from, true)
+                if not at then break end
+                positions[#positions + 1] = at
+                from = at + 1
+            end
+            if #positions >= 3 then
+                local period = positions[2] - positions[1]
+                if period >= 300 and period * 2 <= total then
+                    local periodic = true
+                    for i = 3, #positions do
+                        if positions[i] - positions[i - 1] ~= period then
+                            periodic = false
+                            break
+                        end
+                    end
+                    if periodic and positions[3] + period - 1 <= total + 80 then
+                        local first = text:sub(positions[1], positions[2] - 1)
+                        local second = text:sub(positions[2], positions[3] - 1)
+                        if first == second then
+                            -- 保留开头到第二份之前（含标题区），再去掉数据源自带的重复标题行
+                            local single = text:sub(1, positions[2] - 1)
+                            local title = single:match("^([^\n]+)")
+                            if title and #title >= 6 then
+                                local again = single:find(title, #title + 1, true)
+                                if again and again <= #title + 12 then
+                                    single = single:sub(1, #title) .. single:sub(again + #title)
+                                end
+                            end
+                            return single
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return text
+end
+
 function Content.truncate(text, max_bytes)
     text = tostring(text or "")
     max_bytes = max_bytes or 120
@@ -220,24 +281,106 @@ function Content.truncate(text, max_bytes)
     return text:sub(1, cut_length) .. "…"
 end
 
+-- formatMarkdown 会给 # / > / - 加可见前缀，标题里不该带着这些符号。
+-- 用显式前缀逐字比对，避免 Lua 5.1 按字节解析 UTF-8 字符类时误删半个汉字。
+local function stripBlockPrefix(text)
+    text = tostring(text or "")
+    for _, prefix in ipairs({ "■ ", "◆ ", "· ", "• ", "┃ ", "■", "◆", "•", "┃" }) do
+        if text:sub(1, #prefix) == prefix then
+            text = text:sub(#prefix + 1)
+            break
+        end
+    end
+    return trim(text)
+end
+
+Content.stripBlockPrefix = stripBlockPrefix
+
+local function isTruncatedTitle(title)
+    return title:match("%.%.%.$") ~= nil or title:match("…$") ~= nil
+end
+
 function Content.topicTitle(topic)
     topic = topic or {}
     local title = Content.singleLine(topic.title)
     local content = Content.formatMarkdown(Content.parse(topic.content))
     local first_line = Content.singleLine(content:match("^([^\n]+)") or content)
-    if title == "" or (title:match("%.%.%.$") and #first_line > #title) then
+    if title == "" or (isTruncatedTitle(title) and #first_line > #title) then
         title = first_line
     end
+    title = Content.singleLine(stripBlockPrefix(title))
     if title == "" then title = "无标题帖子" end
     return Content.truncate(title, 150)
 end
 
-function Content.topicText(topic)
+-- 转载原帖：MCP 返回 referenced_topic = { topic = { title, owner, content, topic_id, group ... } }。
+-- 统一成 { title, author, group, time, content, url, topic_id }，默认视图与图文模式共用。
+function Content.referencedTopic(topic)
+    local ref = topic and topic.referenced_topic
+    if type(ref) ~= "table" then return nil end
+    local t = ref.topic or ref
+    if type(t) ~= "table" then return nil end
+    local raw = t.content or t.text
+    if trim(raw) == "" and type(t.question) == "table" then
+        raw = t.question.text or t.question.content
+    end
+    local body = Content.formatMarkdown(Content.parse(Content.dedupeRepeatedBody(raw)))
+    local owner = t.owner or {}
+    local group_name = (type(t.group) == "table" and t.group.name) or ""
+    local title = Content.singleLine(t.title)
+    local first_line = Content.singleLine(body:match("^([^\n]+)") or body)
+    if title == "" or (isTruncatedTitle(title) and #first_line > #title) then
+        title = first_line
+    end
+    title = Content.singleLine(stripBlockPrefix(title))
+    if title == "" then title = "转载原帖" end
+    local group_id = (type(t.group) == "table" and t.group.group_id)
+        or (type(topic.group) == "table" and topic.group.group_id)
+    local topic_id = tostring(t.topic_id or "")
+    local url
+    if topic_id ~= "" and group_id and tostring(group_id) ~= "" then
+        url = "https://wx.zsxq.com/group/" .. tostring(group_id) .. "/topic/" .. topic_id
+    elseif topic_id ~= "" then
+        url = "https://wx.zsxq.com/topic/" .. topic_id
+    end
+    return {
+        title = title,
+        author = Content.displayName(owner),
+        group = group_name,
+        time = Content.longTime(t.create_time),
+        content = body,
+        url = url,
+        topic_id = topic_id,
+    }
+end
+
+-- 转载原帖区块（纯文本）：标题 / 作者 / 正文；原帖链接统一进 links 区，避免重复两遍。
+function Content.referencedText(topic)
+    local ref = Content.referencedTopic(topic)
+    if not ref then return "" end
+    local head = { ref.author }
+    if ref.group ~= "" then table.insert(head, ref.group) end
+    if ref.time ~= "" then table.insert(head, ref.time) end
+    return table.concat({
+        "────────────────",
+        "【转载原帖】",
+        "标题：" .. ref.title,
+        "作者：" .. table.concat(head, " · "),
+        "",
+        ref.content ~= "" and ref.content or "（原帖无文字正文）",
+    }, "\n")
+end
+
+-- 纯正文 + 链接，供图文 HTML 使用：不含 topicText 的元数据头和链接区。
+-- 旧实现用 text:match("────────────────\n(.*)$") 切正文，会把 topicText 自带的
+-- 「链接：」区一起切进来，导致 HTML 末尾又追加一次链接区（链接重复、标题重复）。
+function Content.topicBody(topic)
     topic = topic or {}
     local raw = topic.content or topic.text
     if trim(raw) == "" and type(topic.question) == "table" then
         raw = topic.question.text or topic.question.content
     end
+    raw = Content.dedupeRepeatedBody(raw)
     local body, links = Content.parse(raw)
     body = Content.formatMarkdown(body)
     if type(topic.answer) == "table" then
@@ -253,12 +396,21 @@ function Content.topicText(topic)
         addLink(links, seen, article_url, article.title or "知识星球长文")
         if body == "" then body = "【长文】" .. (article.title or "请点击下方链接阅读") end
     end
+    local ref = Content.referencedTopic(topic)
+    if ref and ref.url then
+        addLink(links, seen, ref.url, "转载原帖：" .. ref.title)
+    end
+    return body, links
+end
 
+function Content.topicText(topic)
+    topic = topic or {}
+    local body, links = Content.topicBody(topic)
     local owner = topic.owner or {}
     local counts = topic.counts or {}
     local lines = {}
     -- 头部一行：名字 [位置] 时间（不显示标签）
-    local head = { owner.alias or owner.name or "未知" }
+    local head = { Content.displayName(owner) }
     local location = owner.location or topic.location
     if location and location ~= "" then table.insert(head, location) end
     table.insert(head, Content.longTime(topic.create_time))
@@ -268,6 +420,8 @@ function Content.topicText(topic)
         tostring(counts.comments or 0), tostring(counts.likes or 0), tostring(counts.readers or 0)))
     table.insert(lines, "\n────────────────\n")
     table.insert(lines, body ~= "" and body or "（此帖子没有文字正文）")
+    local ref_text = Content.referencedText(topic)
+    if ref_text ~= "" then table.insert(lines, "\n\n" .. ref_text) end
     if #links > 0 then
         table.insert(lines, "\n\n────────────────\n链接：")
         for i, link in ipairs(links) do
@@ -280,7 +434,7 @@ end
 local function commentHeader(comment, number, indent)
     local owner = comment.owner or {}
     return string.format("%s%s. %s · %s · ♥ %s", indent or "", tostring(number),
-        owner.name or owner.alias or "未知", Content.longTime(comment.create_time),
+        Content.displayName(owner), Content.longTime(comment.create_time),
         tostring(comment.likes_count or 0))
 end
 
@@ -310,7 +464,7 @@ function Content.commentsText(comments, total_count, first_number)
             local repliee = reply.repliee and reply.repliee.name
             -- 楼中楼：单行格式，无序号、无时间（↳ 昵称 回复 @某人：正文）
             table.insert(output, string.format("  ↳ %s%s：%s",
-                (reply.owner and reply.owner.name) or "未知",
+                Content.displayName(reply.owner),
                 repliee and (" 回复 @" .. repliee) or "",
                 Content.singleLine(reply_body)))
             table.insert(flat, { comment = reply, depth = 1, label = reply_body })
