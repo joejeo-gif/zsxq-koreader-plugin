@@ -267,6 +267,28 @@ function API:getTopic(topic_id)
     return self:call("get_topic_info", { topic_id = tostring(topic_id) })
 end
 
+-- 搜索已加入的星球（按名称）。返回 groups = { { group_id, name }, ... }。
+function API:searchGroups(keyword)
+    return self:call("search_groups", { keyword = tostring(keyword or "") })
+end
+
+-- 在指定星球内全文检索主题（官方 RAG 检索）。返回 topics_brief = { topic, ... }。
+function API:searchTopics(group_id, query)
+    return self:call("search_topics", {
+        group_id = tostring(group_id),
+        query = tostring(query or ""),
+    })
+end
+
+-- 在指定星球内按昵称检索成员。返回 members = { member, ... }。
+function API:searchMembers(group_id, keyword, limit)
+    return self:call("search_group_members", {
+        group_id = tostring(group_id),
+        keyword = tostring(keyword or ""),
+        limit = limit or 20,
+    })
+end
+
 function API:getComments(topic_id, index, limit)
     local args = { topic_id = tostring(topic_id), limit = limit or 30 }
     if index and index ~= "" then args.index = index end

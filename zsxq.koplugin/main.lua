@@ -249,6 +249,27 @@ function Zsxq:addToMainMenu(menu_items)
                 callback = function() self:showGroups() end,
             },
             {
+                text = "🔍 " .. _("搜索"),
+                sub_item_table = {
+                    {
+                        text = _("按名称搜索星球"),
+                        callback = function() self:searchGroupsByName() end,
+                    },
+                    {
+                        text = _("在星球内搜索主题"),
+                        callback = function() self:searchTopicsInGroup() end,
+                    },
+                    {
+                        text = _("搜索全部星球主题"),
+                        callback = function() self:searchTopicsAllGroups() end,
+                    },
+                    {
+                        text = _("按昵称搜索成员"),
+                        callback = function() self:searchMembersInGroup() end,
+                    },
+                },
+            },
+            {
                 text = _("离线阅读"),
                 callback = function() self:showOfflineGroups() end,
             },
@@ -543,7 +564,7 @@ function Zsxq:confirmPurge()
 end
 
 function Zsxq:showHelp()
-    self:notify("星球墨读 · 出品人：简单的舟\n\n在线阅读：点帖子直接显示全文（秒开，不打开阅读器、不联网下载）。\n\n图片：点「图片」弹窗浏览压缩图，点屏幕左右翻页，关闭立即返回。\n\n划线：点「划线」→ 点选段落 → 确认保存；「我的划线」中查看删除。\n\n翻帖：功能页「上一篇/下一篇」按钮；翻到末尾再按翻页键自动进下一篇（图文模式不再弹「文档结束」菜单）。\n\n评论/发帖：支持评论、楼中楼回复与发帖，发送前需确认。\n\n📖 图文（可选）：进排版文档（标题加粗、图片内嵌），长按滑动选中即划线，点已划线文字可删除/编辑，AI助手等高亮插件按钮也在其中；轻点屏幕上方四分之一区域可弹功能菜单，含下一篇/上一篇/返回帖子列表/关闭图文/跳转开头。\n\n进度条：图文阅读时轻点屏幕底部边缘可呼出/隐藏底部状态栏（含进度条），样式可在 KOReader「设置 → 状态栏」调整。\n\nMarkdown：加粗、标题、列表等标记自动转为阅读友好的样式；长文标题与链接自动去重，只显示一次。\n\n转载：转载帖在正文后附「转载原帖」的标题、作者、正文，原帖链接收在链接区。", 30)
+    self:notify("星球墨读 · 出品人：简单的舟\n\n在线阅读：点帖子直接显示全文（秒开，不打开阅读器、不联网下载）。\n\n图片：点「图片」弹窗浏览压缩图，点屏幕左右翻页，关闭立即返回。\n\n划线：点「划线」→ 点选段落 → 确认保存；「我的划线」中查看删除。\n\n翻帖：功能页「上一篇/下一篇」按钮；翻到末尾再按翻页键自动进下一篇（图文模式不再弹「文档结束」菜单）。\n\n评论/发帖：支持评论、楼中楼回复与发帖，发送前需确认。\n\n📖 图文（可选）：进排版文档（标题加粗、图片内嵌），长按滑动选中即划线，点已划线文字可删除/编辑，AI助手等高亮插件按钮也在其中；轻点屏幕上方四分之一区域可弹功能菜单，含下一篇/上一篇/返回帖子列表/关闭图文/跳转开头。\n\n进度条：图文阅读时轻点屏幕底部边缘可呼出/隐藏底部状态栏（含进度条），样式可在 KOReader「设置 → 状态栏」调整。\n\nMarkdown：加粗、标题、列表等标记自动转为阅读友好的样式；长文标题与链接自动去重，只显示一次。\n\n转载：转载帖在正文后附「转载原帖」的标题、作者、正文，原帖链接收在链接区。\n\n🔍 搜索：主菜单「搜索」下有按名称搜星球、星球内搜主题、全部星球搜主题（遍历你已加入的星球，去重后按星球标注）、按昵称搜成员；搜索结果点开可正常连读与缓存。", 30)
 end
 
 -- ============ 连接诊断 ============
@@ -687,6 +708,250 @@ function Zsxq:showGroups()
             return
         end
         self:openGroupsList(data, from_cache)
+    end)
+end
+
+-- ===== 搜索（基于官方 search_groups / search_topics / search_group_members）=====
+
+-- 通用关键词输入：确认非空后回调。
+function Zsxq:promptSearchInput(title, description, hint, callback)
+    local dialog
+    dialog = InputDialog:new{
+        title = title,
+        description = description,
+        input_hint = hint,
+        width = Screen:getWidth() - Screen:scaleBySize(24),
+        buttons = {{
+            {
+                text = _("取消"),
+                id = "close",
+                callback = function() UIManager:close(dialog) end,
+            },
+            {
+                text = _("搜索"),
+                callback = function()
+                    local keyword = Content.trim(dialog:getInputText())
+                    if keyword == "" then
+                        self:notify("请输入搜索关键词。", 4)
+                        return
+                    end
+                    UIManager:close(dialog)
+                    callback(keyword)
+                end,
+            },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+-- 让用户从已加入星球中选一个，供"星球内搜索"复用。
+function Zsxq:chooseSearchGroup(callback)
+    if not self:ensureToken() then return end
+    local function proceed(groups)
+        local items = {}
+        for _, g in ipairs(groups) do
+            local group = g
+            table.insert(items, {
+                text = group.name or tostring(group.group_id),
+                callback = function() callback(group) end,
+            })
+        end
+        self:showMenu("选择星球", items, string.format("共 %d 个已加入星球", #groups))
+    end
+    local cached = self.cache:get("groups")
+    if cached and type(cached.groups) == "table" and #cached.groups > 0 then
+        proceed(cached.groups)
+        return
+    end
+    NetworkMgr:runWhenOnline(function()
+        local ok, data = self:withLoading("正在加载星球列表…", function()
+            return self:getAPI():getGroups(100)
+        end)
+        if ok and type(data.groups) == "table" and #data.groups > 0 then
+            self.cache:put("groups", data)
+            proceed(data.groups)
+        else
+            self:showError("星球列表加载失败", data)
+        end
+    end)
+end
+
+-- 主题搜索结果列表：复用 openTopic 的上下文，支持上下篇连读与图文模式。
+-- 全局搜索时 topic._group_name 标记来源星球，显示在标题前。
+function Zsxq:openSearchTopicsList(topics, subtitle, back)
+    local function reopen()
+        self:openSearchTopicsList(topics, subtitle, back)
+    end
+    local function topic_context(index)
+        return {
+            topic = topics[index],
+            rebuild = reopen,
+            prev_topic = topics[index - 1] and function()
+                self:openTopic(topics[index - 1], topic_context(index - 1))
+            end or nil,
+            next_topic = topics[index + 1] and function()
+                self:openTopic(topics[index + 1], topic_context(index + 1))
+            end or nil,
+            prev_reading = topics[index - 1] and function()
+                self:openHighlightReader(topics[index - 1], topic_context(index - 1))
+            end or nil,
+            next_reading = topics[index + 1] and function()
+                self:openHighlightReader(topics[index + 1], topic_context(index + 1))
+            end or nil,
+        }
+    end
+    local items = {}
+    for index, t in ipairs(topics) do
+        local ctx = topic_context(index)
+        local title = Content.topicTitle(t)
+        if t._group_name then title = "[" .. t._group_name .. "] " .. title end
+        table.insert(items, {
+            text = title,
+            mandatory = Content.displayName(t.owner),
+            callback = function() self:openTopic(t, ctx) end,
+        })
+    end
+    self:showMenu("搜索结果 · 主题", items,
+        subtitle or string.format("共 %d 篇 · 关闭阅读页回到此列表", #topics), back)
+end
+
+-- 1) 按名称搜索星球：点结果进入星球主页。
+function Zsxq:searchGroupsByName()
+    if not self:ensureToken() then return end
+    self:promptSearchInput("搜索星球", "按名称搜索你已加入的星球。", "星球名称关键词", function(keyword)
+        NetworkMgr:runWhenOnline(function()
+            local ok, data = self:withLoading("正在搜索星球…", function()
+                return self:getAPI():searchGroups(keyword)
+            end)
+            if not ok then self:showError("星球搜索失败", data); return end
+            local groups = type(data.groups) == "table" and data.groups or {}
+            if #groups == 0 then
+                self:notify("没有找到匹配的星球。", 5)
+                return
+            end
+            local items = {}
+            for _, g in ipairs(groups) do
+                local group = g
+                table.insert(items, {
+                    text = group.name or tostring(group.group_id),
+                    callback = function()
+                        self:openGroupPage(group, function() self:searchGroupsByName() end)
+                    end,
+                })
+            end
+            self:showMenu("搜索结果 · 星球", items,
+                string.format("找到 %d 个星球：%s", #groups, keyword))
+        end)
+    end)
+end
+
+-- 2) 在指定星球内搜索主题。
+function Zsxq:searchTopicsInGroup()
+    self:chooseSearchGroup(function(group)
+        self:promptSearchInput("搜索主题", "在「" .. (group.name or "") .. "」内全文检索主题。",
+            "主题关键词", function(keyword)
+                NetworkMgr:runWhenOnline(function()
+                    local ok, data = self:withLoading("正在搜索主题…", function()
+                        return self:getAPI():searchTopics(group.group_id, keyword)
+                    end)
+                    local topics = ok and type(data.topics_brief) == "table" and data.topics_brief or {}
+                    if not ok then self:showError("主题搜索失败", data); return end
+                    if #topics == 0 then
+                        self:notify("没有找到相关主题。", 5)
+                        return
+                    end
+                    for _, t in ipairs(topics) do t._group_name = group.name or group.group_id end
+                    self:openSearchTopicsList(topics,
+                        string.format("「%s」找到 %d 篇：%s", group.name or "", #topics, keyword))
+                end)
+            end)
+    end)
+end
+
+-- 3) 搜索全部星球主题：遍历已加入星球，逐个检索后按 topic_id 去重合并。
+-- 逐个异步调度（每步一次网络请求），让墨水屏有机会刷新；失败星球自动跳过。
+function Zsxq:searchTopicsAllGroups()
+    if not self:ensureToken() then return end
+    self:promptSearchInput("搜索全部星球", "将遍历你已加入的全部星球，可能需要一些时间。",
+        "搜索关键词", function(keyword)
+            NetworkMgr:runWhenOnline(function()
+                local ok, data = self:withLoading("正在加载星球列表…", function()
+                    return self:getAPI():getGroups(100)
+                end)
+                if not ok or type(data.groups) ~= "table" then
+                    self:showError("星球列表加载失败", data)
+                    return
+                end
+                local groups = data.groups
+                local all, seen = {}, {}
+                local total = #groups
+                local function step(i)
+                    if i > total then
+                        if #all == 0 then
+                            self:notify("全部星球中没有找到相关主题。", 5)
+                            return
+                        end
+                        self:openSearchTopicsList(all, string.format(
+                            "在 %d 个星球中找到 %d 篇：%s", total, #all, keyword))
+                        return
+                    end
+                    local g = groups[i]
+                    -- pcall 首值是"调用未抛错"，其后才是 API 的 (ok, data) 两值
+                    local sok, api_ok, sdata = pcall(function()
+                        return self:getAPI():searchTopics(g.group_id, keyword)
+                    end)
+                    if sok and api_ok and type(sdata) == "table"
+                        and type(sdata.topics_brief) == "table" then
+                        for _, t in ipairs(sdata.topics_brief) do
+                            local tid = tostring(t.topic_id or "")
+                            if tid ~= "" and not seen[tid] then
+                                seen[tid] = true
+                                t._group_name = g.name or g.group_id
+                                table.insert(all, t)
+                            end
+                        end
+                    end
+                    UIManager:scheduleIn(0.01, function() step(i + 1) end)
+                end
+                self:notify(string.format("正在搜索 %d 个星球…", total), 3)
+                step(1)
+            end)
+        end)
+end
+
+-- 4) 按昵称搜索星球成员。MCP 暂无按用户列帖工具，点成员显示其编号/加入时间。
+function Zsxq:searchMembersInGroup()
+    self:chooseSearchGroup(function(group)
+        self:promptSearchInput("搜索成员", "在「" .. (group.name or "") .. "」内按昵称搜索成员。",
+            "昵称关键词", function(keyword)
+                NetworkMgr:runWhenOnline(function()
+                    local ok, data = self:withLoading("正在搜索成员…", function()
+                        return self:getAPI():searchMembers(group.group_id, keyword, 50)
+                    end)
+                    if not ok then self:showError("成员搜索失败", data); return end
+                    local members = type(data.members) == "table" and data.members or {}
+                    if #members == 0 then
+                        self:notify("没有找到匹配的成员。", 5)
+                        return
+                    end
+                    local items = {}
+                    for _, m in ipairs(members) do
+                        local member = m
+                        table.insert(items, {
+                            text = member.name or tostring(member.user_id),
+                            mandatory = tostring(member.number or ""),
+                            callback = function()
+                                self:notify(string.format("%s\n星球编号：%s\n加入时间：%s",
+                                    member.name or "", tostring(member.number or ""),
+                                    Content.shortTime(member.join_time)), 8)
+                            end,
+                        })
+                    end
+                    self:showMenu("搜索结果 · 成员", items,
+                        string.format("找到 %d 位成员：%s", #members, keyword))
+                end)
+            end)
     end)
 end
 

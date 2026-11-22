@@ -32,7 +32,18 @@ end
 package.preload["ui/widget/buttondialog"] = function() return widget("ButtonDialog") end
 package.preload["ui/widget/confirmbox"] = function() return widget("ConfirmBox") end
 package.preload["ui/widget/infomessage"] = function() return widget("InfoMessage") end
-package.preload["ui/widget/inputdialog"] = function() return widget("InputDialog") end
+package.preload["ui/widget/inputdialog"] = function()
+    return {
+        new = function(_, args)
+            args = args or {}
+            args._kind = "InputDialog"
+            args.buttons_table = args.buttons
+            args.onShowKeyboard = args.onShowKeyboard or function() end
+            args.getInputText = args.getInputText or function(self) return self.input or "" end
+            return args
+        end,
+    }
+end
 package.preload["ui/widget/menu"] = function() return widget("Menu") end
 package.preload["ui/widget/qrmessage"] = function() return widget("QRMessage") end
 package.preload["ui/widget/textviewer"] = function() return widget("TextViewer") end
@@ -176,8 +187,12 @@ local menu_items = {}
 Zsxq:addToMainMenu(menu_items)
 check(menu_items.zsxq and menu_items.zsxq.text == "星球墨读", "plugin must be renamed to 星球墨读")
 check(menu_items.zsxq.sorting_hint == "tools", "plugin must live in the tools first-level menu")
-check(#menu_items.zsxq.sub_item_table == 4, "online, offline, highlights and settings entries expected")
-check(#menu_items.zsxq.sub_item_table[4].sub_item_table == 6, "settings submenu should have six entries")
+check(#menu_items.zsxq.sub_item_table == 5,
+    "online, search, offline, highlights and settings entries expected")
+check(menu_items.zsxq.sub_item_table[2].text == "🔍 搜索", "search entry should be present")
+check(#menu_items.zsxq.sub_item_table[2].sub_item_table == 4,
+    "search submenu should have four entries (groups, topics, all, members)")
+check(#menu_items.zsxq.sub_item_table[5].sub_item_table == 6, "settings submenu should have six entries")
 
 -- ===== 测试数据 =====
 local group = { group_id = "g1", name = "测试星球" }
@@ -1020,5 +1035,132 @@ preview.buttons_table[1][2].callback()
 check(#create_calls == 1 and create_calls[1].group_id == "g1" and create_calls[1].title == "标题",
     "confirmed publish calls createTopic with group/title/content")
 check(refreshed, "successful publish should refresh the topic list")
+
+-- ===== 搜索：按名称搜星球 / 星球内搜主题 / 全部星球搜主题 / 搜成员 =====
+local search_calls = {}
+local search_group_a = { group_id = "g1", name = "测试星球" }
+local search_group_b = { group_id = "g3", name = "另一个星球" }
+local found_topic_1 = make_topic("s1", "搜索正文一", search_group_a)
+local found_topic_2 = make_topic("s2", "搜索正文二", search_group_b)
+Zsxq.getAPI = function()
+    return {
+        getGroups = function()
+            return true, { groups = { search_group_a, search_group_b } }
+        end,
+        searchGroups = function(_, keyword)
+            search_calls[#search_calls + 1] = { tool = "search_groups", keyword = keyword }
+            if keyword == "无结果" then return true, { groups = {}, success = true } end
+            return true, { groups = { { group_id = "g1", name = "测试星球" } }, success = true }
+        end,
+        searchTopics = function(_, group_id, query)
+            search_calls[#search_calls + 1] = { tool = "search_topics", group_id = group_id, query = query }
+            if group_id == "g1" then
+                return true, { topics_brief = { found_topic_1 }, success = true }
+            elseif group_id == "g3" then
+                -- 与 g1 不同的 topic_id，应被全局搜索合并
+                return true, { topics_brief = { found_topic_2 }, success = true }
+            end
+            return true, { topics_brief = {}, success = true }
+        end,
+        searchMembers = function(_, group_id, keyword, limit)
+            search_calls[#search_calls + 1] = { tool = "search_group_members", group_id = group_id,
+                keyword = keyword, limit = limit }
+            return true, { members = {
+                { user_id = "u1", name = "简单的舟", number = 5735, join_time = "2025-03-18T20:08:38.890+0800" },
+            }, success = true }
+        end,
+        getTopic = function(_, topic_id)
+            for _, topic in ipairs({ found_topic_1, found_topic_2 }) do
+                if topic.topic_id == topic_id then return true, { topic = topic } end
+            end
+            return false, "not found"
+        end,
+    }
+end
+
+-- 输入对话框 helper：填入关键词并点「搜索」按钮
+local function submit_search(keyword)
+    local dialog = last("InputDialog")
+    assert(dialog ~= nil, "search input dialog must open")
+    dialog.input = keyword
+    dialog.buttons_table[1][2].callback()
+end
+
+-- 1) 按名称搜星球
+Zsxq:searchGroupsByName()
+check(last("InputDialog") ~= nil, "group search opens keyword input")
+submit_search("测试")
+check(search_calls[#search_calls].tool == "search_groups"
+    and search_calls[#search_calls].keyword == "测试", "group search calls search_groups with keyword")
+local group_result_menu = Zsxq.list_menu
+check(group_result_menu ~= nil and group_result_menu.title == "搜索结果 · 星球"
+    and #group_result_menu.item_table == 1, "group search result menu shows matched group")
+check(group_result_menu.item_table[1].text == "测试星球", "matched group name shown")
+group_result_menu.item_table[1].callback() -- 进入星球主页
+check(Zsxq.list_menu ~= nil and Zsxq.list_menu.title == "测试星球",
+    "group search result opens group page")
+
+-- 空关键词不应触发搜索
+local calls_before = #search_calls
+Zsxq:searchGroupsByName()
+submit_search("   ")
+check(#search_calls == calls_before, "blank keyword must not trigger a search")
+local empty_dialog = last("InputDialog")
+if empty_dialog then empty_dialog.buttons_table[1][1].callback() end -- 取消
+
+-- 无结果提示
+Zsxq:searchGroupsByName()
+submit_search("无结果")
+check(last_notify() ~= nil and last_notify().text:match("没有找到匹配") ~= nil,
+    "empty group search shows a no-result notice")
+
+-- 2) 星球内搜主题（chooseSearchGroup 用缓存星球列表，点第一个星球）
+store["groups"] = { groups = { search_group_a, search_group_b } }
+Zsxq:searchTopicsInGroup()
+local pick_menu = Zsxq.list_menu
+check(pick_menu ~= nil and pick_menu.title == "选择星球"
+    and #pick_menu.item_table == 2, "topic search asks to pick a group")
+pick_menu.item_table[1].callback() -- 测试星球
+submit_search("复利")
+check(search_calls[#search_calls].tool == "search_topics"
+    and search_calls[#search_calls].group_id == "g1"
+    and search_calls[#search_calls].query == "复利", "topic search forwards group id and query")
+local topic_result_menu = Zsxq.list_menu
+check(topic_result_menu ~= nil and topic_result_menu.title == "搜索结果 · 主题"
+    and #topic_result_menu.item_table == 1, "topic search result menu shows matched topic")
+check(topic_result_menu.item_table[1].text:match("测试星球") ~= nil,
+    "single-group result is tagged with source group")
+-- 点开搜索结果能进入阅读页
+topic_result_menu.item_table[1].callback()
+check(last("TextViewer") ~= nil and last("TextViewer").text:match("搜索正文一") ~= nil,
+    "topic search result opens the reader")
+
+-- 3) 全部星球搜主题：遍历 + 去重（s1/s2 均唯一，g3 返回不同 id）
+-- 全星球搜索用 scheduleIn 串起 step 链；测试桩默认只入栈不执行。
+-- 这里临时把 scheduleIn 换成立即执行，让整条链跑完后再恢复。
+local UM = require("ui/uimanager")
+local real_schedule = UM.scheduleIn
+UM.scheduleIn = function(_, _, fn) fn() end
+Zsxq:searchTopicsAllGroups()
+submit_search("复利")
+UM.scheduleIn = real_schedule
+local all_result_menu = Zsxq.list_menu
+check(all_result_menu ~= nil and all_result_menu.title == "搜索结果 · 主题"
+    and #all_result_menu.item_table == 2,
+    "all-groups search merges topics from every group")
+
+-- 4) 按昵称搜成员
+Zsxq:searchMembersInGroup()
+pick_menu = Zsxq.list_menu
+check(pick_menu ~= nil and pick_menu.title == "选择星球", "member search asks to pick a group")
+pick_menu.item_table[1].callback()
+submit_search("舟")
+check(search_calls[#search_calls].tool == "search_group_members"
+    and search_calls[#search_calls].keyword == "舟"
+    and search_calls[#search_calls].limit == 50, "member search forwards keyword and limit")
+local member_result_menu = Zsxq.list_menu
+check(member_result_menu ~= nil and member_result_menu.title == "搜索结果 · 成员"
+    and #member_result_menu.item_table == 1, "member search result menu shows matched member")
+check(member_result_menu.item_table[1].text == "简单的舟", "member nickname shown")
 
 print(string.format("test_main: %d assertions passed", passed))

@@ -206,6 +206,26 @@ check(post_api:createTopic("g1", "标题", "正文") == false, "business failure
 check(post_api:createTopic("", "标题", "正文") == false, "empty group id rejected")
 check(post_api:createTopic("g1", "  ", "  ") == false, "blank title and content rejected")
 
+-- 搜索 API 封装：三个官方工具的参数透传
+local search_api = API.new("token")
+local search_tool, search_args
+search_api.call = function(self, tool, args)
+    search_tool, search_args = tool, args
+    return true, { success = true }
+end
+search_api:searchGroups("半隐书院")
+check(search_tool == "search_groups" and search_args.keyword == "半隐书院",
+    "searchGroups forwards keyword to search_groups")
+search_api:searchTopics("28882552825211", "复利")
+check(search_tool == "search_topics" and search_args.group_id == "28882552825211"
+    and search_args.query == "复利", "searchTopics forwards group_id and query")
+search_api:searchMembers("28882552825211", "舟", 30)
+check(search_tool == "search_group_members" and search_args.group_id == "28882552825211"
+    and search_args.keyword == "舟" and search_args.limit == 30,
+    "searchMembers forwards group_id, keyword and limit")
+search_api:searchMembers("g1", "舟")
+check(search_args.limit == 20, "searchMembers uses a default limit of 20")
+
 local article_text, article_links = Content.topicText({
     content = "",
     talk = { article = { inline_article_url = "https://articles.zsxq.com/id_inline.html", title = "内嵌长文" } },
